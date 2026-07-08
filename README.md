@@ -9,6 +9,20 @@ No TAMUBOT or internal dependencies — runs on any machine with Python 3.10+.
 |---|---|---|---|
 | `simple_syllabus_scraper.py` | tamu.simplesyllabus.com | Playwright (headless Chromium) | PDF syllabi |
 | `howdy_portal_scraper.py` | howdyportal.tamu.edu | requests (HTTP) | JSON + PDF syllabi |
+| **`gui.py`** | **both** | **tkinter desktop app** | **one-click: auto-discovers all departments, scrapes both sources** |
+
+---
+
+## Quickest start: GUI
+
+```bash
+pip install -r requirements.txt
+python gui.py
+```
+
+Opens a desktop window. Defaults are already set to scrape everything — all departments in College Station, both graduate and undergraduate, all 2026 terms. Just click **Start Scraping**.
+
+![GUI has checkboxes for sources, departments, course levels, terms, and output dir, plus a dark terminal-style log panel]
 
 ---
 
