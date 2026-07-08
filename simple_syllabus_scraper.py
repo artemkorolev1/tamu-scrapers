@@ -82,29 +82,6 @@ def get_config(args):
     }
 
 
-def discover_departments(terms: list[str]) -> set[str]:
-    """Query Howdy Portal and return all unique College Station subject codes for the given terms."""
-    session = requests.Session()
-    session.headers["User-Agent"] = "TAMU-Student-Project-Research"
-    subjects: set[str] = set()
-    for term_name in terms:
-        term_code = HOWDY_TERM_CODES.get(term_name)
-        if not term_code:
-            print(f"  No Howdy term code for '{term_name}', skipping department discovery for this term")
-            continue
-        print(f"  Querying Howdy Portal for {term_name} ({term_code})…")
-        try:
-            resp = session.post(HOWDY_SECTIONS_API, json={"termCode": term_code}, timeout=60)
-            resp.raise_for_status()
-            for section in resp.json():
-                if section.get("SWV_CLASS_SEARCH_SITE") == "College Station":
-                    subj = section.get("SWV_CLASS_SEARCH_SUBJECT")
-                    if subj:
-                        subjects.add(subj)
-        except Exception as e:
-            print(f"  Warning: could not discover departments for {term_name}: {e}")
-    return subjects
-
 
 def term_label(term_name: str) -> str:
     """'Spring 2026' -> 'Spring_2026'"""
@@ -275,18 +252,93 @@ def bytes_used(cfg: dict) -> float:
     return sum(f.stat().st_size for f in root.rglob("*.pdf")) / (1024 * 1024)
 
 
+def run_simple_syllabus_scrape(output_dir, departments, terms, graduate_only, delay, max_retries, max_mb, all_departments=False, log_callback=None):
+    """
+    Scrape syllabi from tamu.simplesyllabus.com.
+    Returns {'downloaded': int, 'skipped': int, 'failed': int, 'total_matches': int, 'output_dir': str}
+    """
+    def log(msg):
+        if log_callback:
+            log_callback(msg)
+        else:
+            print(msg)
+
+    if all_departments:
+        from howdy_portal_scraper import discover_all_departments
+        log("Discovering departments from Howdy Portal…")
+        term_codes = [HOWDY_TERM_CODES.get(t, t) for t in terms if t in HOWDY_TERM_CODES]
+        discovered = discover_all_departments(term_codes)
+        if not discovered:
+            log("Warning: no departments discovered; falling back to provided list")
+        else:
+            departments = sorted(discovered)
+            log(f"Discovered {len(departments)} departments")
+
+    output_dir = Path(output_dir)
+    cfg = {
+        "departments": list(departments),
+        "target_terms": list(terms),
+        "graduate_only": graduate_only,
+        "delay": delay,
+        "max_retries": max_retries,
+        "max_mb": max_mb,
+        "output_dir": output_dir,
+    }
+
+    downloaded = 0
+    skipped = 0
+    failed = 0
+    all_matches: list[dict] = []
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context()
+        page = context.new_page()
+
+        log("Seeding session…")
+        seed_session(page)
+
+        for dept in tqdm(cfg["departments"], desc="Collecting", unit="dept"):
+            matches = collect_matches(page, dept, cfg)
+            all_matches.extend(matches)
+            tqdm.write(f"  {dept}: {len(matches)} matches")
+            time.sleep(cfg["delay"])
+
+        log(f"Total matches: {len(all_matches)}")
+
+        for match in tqdm(all_matches, desc="Downloading", unit="pdf"):
+            if cfg["max_mb"] > 0 and bytes_used(cfg) >= cfg["max_mb"]:
+                tqdm.write(f"Reached {cfg['max_mb']} MB limit, stopping.")
+                break
+
+            out_path = pdf_path(cfg, match)
+            if out_path.exists():
+                skipped += 1
+                continue
+
+            ok = download_pdf(page, match, out_path, cfg)
+            if ok:
+                update_metadata(out_path.parent, match, out_path)
+                downloaded += 1
+            else:
+                failed += 1
+
+            time.sleep(cfg["delay"])
+
+        browser.close()
+
+    return {
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "failed": failed,
+        "total_matches": len(all_matches),
+        "output_dir": str(output_dir),
+    }
+
+
 def main():
     args = parse_args()
     cfg = get_config(args)
-
-    if cfg["all_departments"]:
-        print("Discovering departments from Howdy Portal…")
-        discovered = discover_departments(cfg["target_terms"])
-        if not discovered:
-            print("Warning: no departments discovered; falling back to default list")
-        else:
-            cfg["departments"] = sorted(discovered)
-            print(f"Discovered {len(cfg['departments'])} departments")
 
     print(f"Departments : {cfg['departments']}")
     print(f"Terms       : {cfg['target_terms']}")
@@ -296,56 +348,20 @@ def main():
     print()
 
     try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context()
-            page = context.new_page()
-
-            print("Seeding session…")
-            seed_session(page)
-
-            all_matches: list[dict] = []
-            for dept in tqdm(cfg["departments"], desc="Collecting", unit="dept"):
-                matches = collect_matches(page, dept, cfg)
-                all_matches.extend(matches)
-                tqdm.write(f"  {dept}: {len(matches)} matches")
-                time.sleep(cfg["delay"])
-
-            print(f"\nTotal matches: {len(all_matches)}")
-
-            if cfg["dry_run"]:
-                for m in all_matches:
-                    print(f"  {m['term_name']} | {m['subject']} {m['course']} {m['section']} ({m['crn']})")
-                browser.close()
-                return
-
-            downloaded = 0
-            skipped = 0
-            failed = 0
-
-            for match in tqdm(all_matches, desc="Downloading", unit="pdf"):
-                if cfg["max_mb"] > 0 and bytes_used(cfg) >= cfg["max_mb"]:
-                    tqdm.write(f"Reached {cfg['max_mb']} MB limit, stopping.")
-                    break
-
-                out_path = pdf_path(cfg, match)
-                if out_path.exists():
-                    skipped += 1
-                    continue
-
-                ok = download_pdf(page, match, out_path, cfg)
-                if ok:
-                    update_metadata(out_path.parent, match, out_path)
-                    downloaded += 1
-                else:
-                    failed += 1
-
-                time.sleep(cfg["delay"])
-
-            browser.close()
-
-        print(f"\nDone. Downloaded={downloaded}, Skipped={skipped}, Failed={failed}")
-
+        result = run_simple_syllabus_scrape(
+            output_dir=cfg["output_dir"],
+            departments=cfg["departments"],
+            terms=cfg["target_terms"],
+            graduate_only=cfg["graduate_only"],
+            delay=cfg["delay"],
+            max_retries=cfg["max_retries"],
+            max_mb=cfg["max_mb"],
+            all_departments=cfg["all_departments"],
+        )
+        print(
+            f"\nDone. Downloaded={result['downloaded']}, "
+            f"Skipped={result['skipped']}, Failed={result['failed']}"
+        )
     except KeyboardInterrupt:
         print("\nInterrupted by user. Partial results saved.")
         sys.exit(0)

@@ -10,6 +10,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 
 import requests
 from dotenv import load_dotenv
@@ -44,7 +45,6 @@ def term_label(term_code: str) -> str:
     """202611 -> Spring_2026, falls back to raw code if not in map."""
     if term_code in TERM_CODE_LABELS:
         return TERM_CODE_LABELS[term_code]
-    # Generic fallback: last two digits encode semester
     year = term_code[:4]
     suffix = term_code[4:]
     sem_map = {"11": "Spring", "21": "Summer", "31": "Fall"}
@@ -96,7 +96,6 @@ def fetch_available_terms(session: requests.Session) -> list[dict]:
     resp = session.get(TERMS_API, timeout=30)
     resp.raise_for_status()
     data = resp.json()
-    # API may return list directly or nested under a key
     if isinstance(data, list):
         return data
     return data.get("terms", data.get("data", []))
@@ -276,6 +275,116 @@ def save_data_json(out_dir: Path, records: list[dict]):
     return len(new_records)
 
 
+def discover_all_departments(terms: list[str]) -> set[str]:
+    """Query Howdy Portal sections API for each term and return all subject codes found."""
+    session = make_session()
+    establish_session(session)
+    subjects: set[str] = set()
+    for term_code in terms:
+        try:
+            sections = fetch_sections(session, term_code)
+            for s in sections:
+                subj = section_subject(s)
+                if subj:
+                    subjects.add(subj)
+        except requests.RequestException as e:
+            print(f"Warning: could not fetch sections for term {term_code}: {e}")
+    return subjects
+
+
+def run_howdy_scrape(
+    output_dir,
+    departments: list[str],
+    terms: list[str],
+    graduate_only: bool,
+    delay: float,
+    all_departments: bool,
+    log_callback: Callable[[str], None] | None = None,
+) -> dict:
+    """
+    Core scraping logic for Howdy Portal.
+
+    Returns dict with keys: total_sections, total_pdfs, departments_found.
+    """
+    log = log_callback if log_callback is not None else tqdm.write
+
+    output_dir = Path(output_dir)
+    cfg = {
+        "departments": departments,
+        "all_departments": all_departments,
+        "target_terms": terms,
+        "graduate_only": graduate_only,
+        "delay": delay,
+        "output_dir": output_dir,
+    }
+
+    total_sections = 0
+    total_pdfs = 0
+    departments_found: set[str] = set()
+
+    session = make_session()
+
+    log("Establishing session with Howdy portal…")
+    establish_session(session)
+
+    log("Fetching available terms…")
+    try:
+        available = fetch_available_terms(session)
+        available_codes = {str(t.get("termCode") or t.get("code") or "") for t in available}
+        log(f"  Available terms: {sorted(available_codes)}")
+    except Exception as e:
+        log(f"  Warning: could not fetch term list: {e}")
+        available_codes = set()
+
+    for term_code in tqdm(terms, desc="Terms", unit="term"):
+        if available_codes and term_code not in available_codes:
+            log(f"  Term {term_code} not in available terms, skipping")
+            continue
+
+        log(f"\nFetching sections for term {term_code}…")
+        try:
+            raw_sections = fetch_sections(session, term_code)
+        except requests.RequestException as e:
+            log(f"  Error fetching sections for {term_code}: {e}")
+            continue
+
+        log(f"  Got {len(raw_sections)} total sections")
+        filtered = filter_sections(raw_sections, cfg)
+        log(f"  {len(filtered)} sections after filtering")
+
+        by_subject: dict[str, list[dict]] = {}
+        for s in filtered:
+            subj = section_subject(s)
+            by_subject.setdefault(subj, []).append(s)
+
+        for subj, sections in tqdm(by_subject.items(), desc=f"  {term_code} subjects", unit="dept", leave=False):
+            departments_found.add(subj)
+            total_sections += len(sections)
+
+            tlabel = term_label(term_code)
+            out_dir = output_dir / "howdy_portal" / subj / "graduate" / tlabel
+
+            records = [section_to_record(s, term_code) for s in sections]
+            new_count = save_data_json(out_dir, records)
+            log(f"    {subj}: {len(records)} sections ({new_count} new) -> {out_dir}/data.json")
+
+            pdf_sections = [s for s in sections if has_syllabus(s)]
+            if pdf_sections:
+                log(f"    {subj}: {len(pdf_sections)} sections with syllabus PDFs")
+                for s in tqdm(pdf_sections, desc=f"    PDFs {subj}", unit="pdf", leave=False):
+                    rec = section_to_record(s, term_code)
+                    fname = pdf_filename(term_code, rec)
+                    out_path = out_dir / fname
+                    if download_syllabus_pdf(session, term_code, rec["crn"], out_path, delay):
+                        total_pdfs += 1
+
+    return {
+        "total_sections": total_sections,
+        "total_pdfs": total_pdfs,
+        "departments_found": departments_found,
+    }
+
+
 def main():
     args = parse_args()
     cfg = get_config(args)
@@ -286,63 +395,17 @@ def main():
     print(f"Output      : {cfg['output_dir']}")
     print()
 
-    session = make_session()
-
     try:
-        print("Establishing session with Howdy portal…")
-        establish_session(session)
-
-        print("Fetching available terms…")
-        try:
-            available = fetch_available_terms(session)
-            available_codes = {str(t.get("termCode") or t.get("code") or "") for t in available}
-            print(f"  Available terms: {sorted(available_codes)}")
-        except Exception as e:
-            print(f"  Warning: could not fetch term list: {e}")
-            available_codes = set()
-
-        for term_code in tqdm(cfg["target_terms"], desc="Terms", unit="term"):
-            if available_codes and term_code not in available_codes:
-                tqdm.write(f"  Term {term_code} not in available terms, skipping")
-                continue
-
-            tqdm.write(f"\nFetching sections for term {term_code}…")
-            try:
-                raw_sections = fetch_sections(session, term_code)
-            except requests.RequestException as e:
-                tqdm.write(f"  Error fetching sections for {term_code}: {e}")
-                continue
-
-            tqdm.write(f"  Got {len(raw_sections)} total sections")
-            filtered = filter_sections(raw_sections, cfg)
-            tqdm.write(f"  {len(filtered)} sections after filtering")
-
-            # Group by subject for organized output
-            by_subject: dict[str, list[dict]] = {}
-            for s in filtered:
-                subj = section_subject(s)
-                by_subject.setdefault(subj, []).append(s)
-
-            for subj, sections in tqdm(by_subject.items(), desc=f"  {term_code} subjects", unit="dept", leave=False):
-                tlabel = term_label(term_code)
-                out_dir = cfg["output_dir"] / "howdy_portal" / subj / "graduate" / tlabel
-
-                records = [section_to_record(s, term_code) for s in sections]
-                new_count = save_data_json(out_dir, records)
-                tqdm.write(f"    {subj}: {len(records)} sections ({new_count} new) -> {out_dir}/data.json")
-
-                # Download PDFs for sections that have one
-                pdf_sections = [s for s in sections if has_syllabus(s)]
-                if pdf_sections:
-                    tqdm.write(f"    {subj}: {len(pdf_sections)} sections with syllabus PDFs")
-                    for s in tqdm(pdf_sections, desc=f"    PDFs {subj}", unit="pdf", leave=False):
-                        rec = section_to_record(s, term_code)
-                        fname = pdf_filename(term_code, rec)
-                        out_path = out_dir / fname
-                        download_syllabus_pdf(session, term_code, rec["crn"], out_path, cfg["delay"])
-
-        print("\nDone.")
-
+        result = run_howdy_scrape(
+            output_dir=cfg["output_dir"],
+            departments=cfg["departments"],
+            terms=cfg["target_terms"],
+            graduate_only=cfg["graduate_only"],
+            delay=cfg["delay"],
+            all_departments=cfg["all_departments"],
+        )
+        print(f"\nDone. Sections: {result['total_sections']}, PDFs: {result['total_pdfs']}, "
+              f"Departments: {sorted(result['departments_found'])}")
     except KeyboardInterrupt:
         print("\nInterrupted by user. Partial results saved.")
         sys.exit(0)
