@@ -42,6 +42,12 @@ python simple_syllabus_scraper.py
 # Custom departments and terms
 python simple_syllabus_scraper.py --depts CSCE,ECEN --terms "Spring 2026,Fall 2026"
 
+# Discover every College Station department from Howdy Portal (ignores --depts)
+python simple_syllabus_scraper.py --all-departments
+
+# Include undergraduate courses (course number < 600)
+python simple_syllabus_scraper.py --no-graduate
+
 # Preview matches without downloading
 python simple_syllabus_scraper.py --dry-run
 
@@ -58,6 +64,8 @@ python simple_syllabus_scraper.py --max-mb 500
 |---|---|---|
 | `--depts` | `CSCE,ISEN,STAT,ECEN` | Comma-separated department codes |
 | `--terms` | `Spring 2026,Summer 2026,Fall 2026` | Comma-separated term names |
+| `--all-departments` | off | Discover all College Station departments from Howdy Portal (ignores `--depts`) |
+| `--no-graduate` | off | Include undergraduate courses (course number < 600) |
 | `--dry-run` | off | Print matches without downloading PDFs |
 | `--output-dir` | `./output` | Root directory for output |
 | `--delay` | `1.0` | Seconds between requests |

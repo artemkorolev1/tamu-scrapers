@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+import requests
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from tqdm import tqdm
@@ -37,11 +38,25 @@ TITLE_RE = re.compile(
 DEFAULT_DEPTS = "CSCE,ISEN,STAT,ECEN"
 DEFAULT_TERMS = "Spring 2026,Summer 2026,Fall 2026"
 
+HOWDY_SECTIONS_API = "https://howdyportal.tamu.edu/api/course-sections"
+HOWDY_TERM_CODES = {
+    "Spring 2025": "202511",
+    "Summer 2025": "202521",
+    "Fall 2025":   "202531",
+    "Spring 2026": "202611",
+    "Summer 2026": "202621",
+    "Fall 2026":   "202631",
+}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Scrape syllabi from tamu.simplesyllabus.com")
     p.add_argument("--depts", default=None, help="Comma-separated department codes")
     p.add_argument("--terms", default=None, help="Comma-separated term names")
+    p.add_argument("--all-departments", action="store_true",
+                   help="Discover all College Station departments from Howdy Portal (ignores --depts)")
+    p.add_argument("--no-graduate", action="store_true",
+                   help="Include undergraduate courses (course number < 600)")
     p.add_argument("--dry-run", action="store_true", help="List matches without downloading")
     p.add_argument("--output-dir", default=None, help="Output directory")
     p.add_argument("--delay", type=float, default=None, help="Seconds between requests")
@@ -53,16 +68,42 @@ def parse_args():
 def get_config(args):
     depts_raw = args.depts or os.getenv("DEPARTMENTS", DEFAULT_DEPTS)
     terms_raw = args.terms or os.getenv("TARGET_TERMS", DEFAULT_TERMS)
+    graduate_only = False if args.no_graduate else os.getenv("GRADUATE_ONLY", "true").lower() == "true"
     return {
         "departments": [d.strip() for d in depts_raw.split(",") if d.strip()],
         "target_terms": [t.strip() for t in terms_raw.split(",") if t.strip()],
-        "graduate_only": os.getenv("GRADUATE_ONLY", "true").lower() == "true",
+        "graduate_only": graduate_only,
+        "all_departments": args.all_departments,
         "delay": args.delay if args.delay is not None else float(os.getenv("DELAY", "1.0")),
         "max_retries": args.max_retries if args.max_retries is not None else int(os.getenv("MAX_RETRIES", "5")),
         "max_mb": args.max_mb if args.max_mb is not None else float(os.getenv("MAX_MB", "0")),
         "output_dir": Path(args.output_dir or os.getenv("OUTPUT_DIR", "./output")),
         "dry_run": args.dry_run,
     }
+
+
+def discover_departments(terms: list[str]) -> set[str]:
+    """Query Howdy Portal and return all unique College Station subject codes for the given terms."""
+    session = requests.Session()
+    session.headers["User-Agent"] = "TAMU-Student-Project-Research"
+    subjects: set[str] = set()
+    for term_name in terms:
+        term_code = HOWDY_TERM_CODES.get(term_name)
+        if not term_code:
+            print(f"  No Howdy term code for '{term_name}', skipping department discovery for this term")
+            continue
+        print(f"  Querying Howdy Portal for {term_name} ({term_code})…")
+        try:
+            resp = session.post(HOWDY_SECTIONS_API, json={"termCode": term_code}, timeout=60)
+            resp.raise_for_status()
+            for section in resp.json():
+                if section.get("SWV_CLASS_SEARCH_SITE") == "College Station":
+                    subj = section.get("SWV_CLASS_SEARCH_SUBJECT")
+                    if subj:
+                        subjects.add(subj)
+        except Exception as e:
+            print(f"  Warning: could not discover departments for {term_name}: {e}")
+    return subjects
 
 
 def term_label(term_name: str) -> str:
@@ -237,6 +278,15 @@ def bytes_used(cfg: dict) -> float:
 def main():
     args = parse_args()
     cfg = get_config(args)
+
+    if cfg["all_departments"]:
+        print("Discovering departments from Howdy Portal…")
+        discovered = discover_departments(cfg["target_terms"])
+        if not discovered:
+            print("Warning: no departments discovered; falling back to default list")
+        else:
+            cfg["departments"] = sorted(discovered)
+            print(f"Discovered {len(cfg['departments'])} departments")
 
     print(f"Departments : {cfg['departments']}")
     print(f"Terms       : {cfg['target_terms']}")
